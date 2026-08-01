@@ -693,10 +693,14 @@ def test_contract_zen_overlap_is_verified_go_subset():
     # Zen now also exposes Zen-only chat-completions models; only the overlap is
     # required to match the independently documented common roster.
     assert matrix_overlap == _EXPECTED_COMMON_CHAT_COMPLETIONS
-    # Every entry is a documented Go model present on BOTH tiers.
-    assert ZEN_MODELS.issubset(GO_MODEL_TRANSPORT.keys())
+    # Zen-only models are valid; the independently documented Zen roster must
+    # match the catalog exactly.
+    assert ZEN_MODELS == _EXPECTED_ZEN_CHAT_COMPLETIONS
     for bare_id in ZEN_MODELS:
         assert f"opencode_zen:{bare_id}" in MATRIX, bare_id
+
+    # Only the verified overlap is required to be present on both tiers.
+    for bare_id in _EXPECTED_COMMON_CHAT_COMPLETIONS:
         assert f"opencode_go:{bare_id}" in MATRIX, bare_id
 
 
