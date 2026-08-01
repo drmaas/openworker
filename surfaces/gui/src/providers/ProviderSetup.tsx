@@ -32,10 +32,9 @@ export const KEY_HELP: Record<string, { url: string; label: string }> = {
   qwen: { url: "https://modelstudio.console.alibabacloud.com", label: "alibabacloud.com" },
   minimax: { url: "https://platform.minimax.io", label: "platform.minimax.io" },
   xai: { url: "https://console.x.ai", label: "console.x.ai" },
-  // OpenCode: each picker entry stores its own api_key, but the deep link below
-  // opens the unified settings page either card links to.
+  // OpenCode: each picker entry stores its own api_key and has its own help page.
   opencode_zen: { url: "https://opencode.ai/zen", label: "opencode.ai/zen" },
-  opencode_go: { url: "https://opencode.ai/zen", label: "opencode.ai/zen" },
+  opencode_go: { url: "https://opencode.ai/go", label: "opencode.ai/go" },
 };
 
 export type Verify = { state: "idle" | "testing" | "ok" | "error"; msg?: string };
@@ -115,15 +114,30 @@ export function useProviderSetup(opts?: { onSaved?: () => void }): ProviderSetup
   // Which non-secret field just blur-saved (flashes "✓ Saved" in the input).
   const [fieldSaved, setFieldSaved] = useState<string | null>(null);
   const fieldSavedTimer = useRef<number | null>(null);
+  const mounted = useRef(true);
+  const operation = useRef(0);
+  const cancelTimers = () => {
+    if (backTimer.current !== null) {
+      window.clearTimeout(backTimer.current);
+      backTimer.current = null;
+    }
+    if (fieldSavedTimer.current !== null) {
+      window.clearTimeout(fieldSavedTimer.current);
+      fieldSavedTimer.current = null;
+    }
+  };
 
-  const refreshProviders = () =>
-    getProviders()
-      .then(setProviders)
-      .catch(() => {});
+  const refreshProviders = async () => {
+    const next = await getProviders();
+    if (mounted.current) setProviders(next);
+  };
   useEffect(() => {
-    refreshProviders();
+    mounted.current = true;
+    void refreshProviders().catch(() => {});
     return () => {
-      if (backTimer.current) window.clearTimeout(backTimer.current);
+      mounted.current = false;
+      operation.current += 1;
+      cancelTimers();
     };
   }, []);
 
@@ -131,6 +145,8 @@ export function useProviderSetup(opts?: { onSaved?: () => void }): ProviderSetup
   const credentialed = !!info?.configured && !!info?.needs_key;
 
   const openProvider = (name: string) => {
+    operation.current += 1;
+    cancelTimers();
     const p = providers.find((x) => x.name === name);
     if (sel) setDrafts((d) => ({ ...d, [sel]: fields }));
     const draft = drafts[name];
@@ -144,6 +160,8 @@ export function useProviderSetup(opts?: { onSaved?: () => void }): ProviderSetup
   };
 
   const backToGallery = () => {
+    operation.current += 1;
+    cancelTimers();
     // Stash only UNSAVED input. The unconditional stash used to capture the just-saved
     // key on the post-Test auto-return, so revisiting a connected provider restored the
     // plaintext key into the field instead of the masked placeholder + saved pill
@@ -157,25 +175,42 @@ export function useProviderSetup(opts?: { onSaved?: () => void }): ProviderSetup
   // you back to the gallery, where the card now wears its ✓ — no extra clicks).
   const runTestAndSave = async (): Promise<boolean> => {
     if (!sel) return false;
+    const name = sel;
+    const token = ++operation.current;
+    cancelTimers();
     setVerify({ state: "testing" });
-    const res = await verifyProvider(sel, fields).catch(() => ({ ok: false, error: "unreachable" }));
+    const res = await verifyProvider(name, fields).catch(() => ({ ok: false, error: "unreachable" }));
+    if (!mounted.current || token !== operation.current || sel !== name) return false;
     if (!res.ok) {
       setVerify({ state: "error", msg: res.error || "couldn't verify" });
       return false;
     }
-    if (dirty || !info?.configured) await setProvider(sel, fields).catch(() => {});
-    if (!info?.needs_key) setKeylessOk((s) => new Set(s).add(sel));
+    if (dirty || !info?.configured) {
+      const saved = await setProvider(name, fields).catch(() => ({ ok: false, error: "unreachable" }));
+      if (!mounted.current || token !== operation.current || sel !== name) return false;
+      if (!saved.ok) {
+        setVerify({ state: "error", msg: saved.error || "couldn't save provider" });
+        return false;
+      }
+    }
+    if (!info?.needs_key) setKeylessOk((s) => new Set(s).add(name));
     setVerify({ state: "ok" });
     setDirty(false);
-    setDrafts((d) => ({ ...d, [sel]: {} }));
-    await refreshProviders();
+    setDrafts((d) => ({ ...d, [name]: {} }));
+    try { await refreshProviders(); } catch (error) {
+      setVerify({ state: "error", msg: error instanceof Error ? error.message : "couldn't refresh providers" });
+      return false;
+    }
+    if (!mounted.current || token !== operation.current || sel !== name) return false;
     opts?.onSaved?.();
     // Let the in-field "✓ Tested & saved" register, then slide home. NOT backToGallery:
     // the timeout would fire its stale closure (dirty/fields from before the save) and
     // re-stash the just-saved key as a draft — the state-restore bug (owner catch
     // 2026-07-19). This return path clears the draft unconditionally.
     backTimer.current = window.setTimeout(() => {
-      setDrafts((d) => ({ ...d, [sel]: {} }));
+      backTimer.current = null;
+      if (!mounted.current || token !== operation.current || sel !== name) return;
+      setDrafts((d) => ({ ...d, [name]: {} }));
       setSel(null);
       setVerify({ state: "idle" });
     }, 900);
@@ -188,31 +223,48 @@ export function useProviderSetup(opts?: { onSaved?: () => void }): ProviderSetup
   // contract; unconfigured providers save everything on their first Test.
   const saveField = async (key: string) => {
     if (!sel || !info?.configured) return;
+    const name = sel;
+    const token = ++operation.current;
+    cancelTimers();
     const spec = info.fields.find((f) => f.key === key);
     if (!spec || spec.secret) return;
     const current = (fields[key] || "").trim();
     const stored = (info.values?.[key] || "").trim();
     if (current === stored) return;
-    const res = await setProvider(sel, { [key]: current }).catch(() => ({ ok: false }));
-    if (!res.ok) return;
-    await refreshProviders();
+    const res = await setProvider(name, { [key]: current }).catch(() => ({ ok: false, error: "couldn't save provider" }));
+    if (!mounted.current || token !== operation.current || sel !== name) return;
+    if (!res.ok) { setVerify({ state: "error", msg: res.error || "couldn't save provider" }); return; }
+    try { await refreshProviders(); } catch (error) {
+      setVerify({ state: "error", msg: error instanceof Error ? error.message : "couldn't refresh providers" });
+      return;
+    }
+    if (!mounted.current || token !== operation.current || sel !== name) return;
     opts?.onSaved?.();
     setFieldSaved(key);
-    if (fieldSavedTimer.current) window.clearTimeout(fieldSavedTimer.current);
-    fieldSavedTimer.current = window.setTimeout(() => setFieldSaved(null), 1400);
+    if (fieldSavedTimer.current !== null) window.clearTimeout(fieldSavedTimer.current);
+    fieldSavedTimer.current = window.setTimeout(() => { fieldSavedTimer.current = null; if (mounted.current) setFieldSaved(null); }, 1400);
   };
 
   // Settings-only: forget the stored key; the card reverts to "Not set up".
   const removeKey = async () => {
     if (!sel) return;
-    await removeProvider(sel).catch(() => {});
-    setDrafts((d) => ({ ...d, [sel]: {} }));
+    const name = sel;
+    const token = ++operation.current;
+    cancelTimers();
+    const removed = await removeProvider(name).catch(() => ({ ok: false, error: "couldn't remove provider" }));
+    if (!mounted.current || token !== operation.current || sel !== name) return;
+    if (!removed.ok) { setVerify({ state: "error", msg: removed.error || "couldn't remove provider" }); return; }
+    setDrafts((d) => ({ ...d, [name]: {} }));
     setKeylessOk((s) => {
       const next = new Set(s);
-      next.delete(sel);
+      next.delete(name);
       return next;
     });
-    await refreshProviders();
+    try { await refreshProviders(); } catch (error) {
+      setVerify({ state: "error", msg: error instanceof Error ? error.message : "couldn't refresh providers" });
+      return;
+    }
+    if (!mounted.current || token !== operation.current || sel !== name) return;
     opts?.onSaved?.();
     setSel(null);
     setVerify({ state: "idle" });
@@ -268,9 +320,7 @@ export function useProviderSetup(opts?: { onSaved?: () => void }): ProviderSetup
     removeKey,
     saveField,
     fieldSaved,
-    cancelBackTimer: () => {
-      if (backTimer.current) window.clearTimeout(backTimer.current);
-    },
+    cancelBackTimer: cancelTimers,
     statusFor,
   };
 }

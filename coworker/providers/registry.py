@@ -30,6 +30,7 @@ from .bedrock_provider import BedrockProvider
 from .gemini_provider import GeminiProvider
 from .openai_provider import OpenAIProvider
 from .vertex_provider import VertexProvider
+from .opencode_contract import OPCODE_GO_ENDPOINT, OPCODE_ZEN_ENDPOINT, SHARED_ENV_KEY, OPEN_CODE_RECOMMENDED
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
 
@@ -555,17 +556,17 @@ DESCRIPTORS: list[ProviderDescriptor] = [
     _compat(
         "opencode_zen",
         "OpenCode Zen",
-        base_url="https://opencode.ai/zen/v1/",
-        recommended_model="gpt-5.6-sol",
-        env_key="OPENCODE_API_KEY",
+        base_url=OPCODE_ZEN_ENDPOINT,
+         recommended_model=OPEN_CODE_RECOMMENDED["opencode_zen"],
+        env_key=SHARED_ENV_KEY,
         endpoint_help="Zen is OpenCode's hosted credit-tier aggregator — credit-based billing across many model providers.",
     ),
     _compat(
         "opencode_go",
         "OpenCode Go",
-        base_url="https://opencode.ai/zen/go/v1/",
-        recommended_model="kimi-k3",
-        env_key="OPENCODE_API_KEY",
+        base_url=OPCODE_GO_ENDPOINT,
+         recommended_model=OPEN_CODE_RECOMMENDED["opencode_go"],
+        env_key=SHARED_ENV_KEY,
         endpoint_help="Go is OpenCode's flat-rate subscription tier with flat-fee access to selected models.",
     ),
     ProviderDescriptor(
@@ -621,6 +622,11 @@ def descriptor_configured(d: ProviderDescriptor, profile: dict[str, Any]) -> boo
         return True  # keyless (Ollama) — usable out of the box
     profile = profile or {}
     if any(f.key == "api_key" for f in d.fields):
+        # Zen and Go deliberately expose independent configured cards.  Their
+        # shared environment fallback is still usable by either client, but it
+        # must not make an unconfigured sibling appear saved/configured.
+        if d.name in {"opencode_zen", "opencode_go"}:
+            return bool(profile.get("api_key"))
         return bool(profile.get("api_key")) or bool(
             d.env_key and os.environ.get(d.env_key)
         )

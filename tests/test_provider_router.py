@@ -510,6 +510,52 @@ def test_provider_suggested_models(tmp_path, monkeypatch):
     assert all(not m.startswith("ollama:") for m in sugg)
 
 
+def test_opencode_suggestions_are_matrix_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    from coworker.server.manager import SessionManager
+
+    mgr = SessionManager(data_dir=tmp_path)
+    common_paid = [
+        "grok-4.5",
+        "grok-build-0.1",
+        "glm-5.2",
+        "glm-5.1",
+        "glm-5",
+        "kimi-k3",
+        "kimi-k2.7-code",
+        "kimi-k2.6",
+        "kimi-k2.5",
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
+        "minimax-m3",
+        "minimax-m2.7",
+        "minimax-m2.5",
+    ]
+    zen_free = [
+        "big-pickle",
+        "deepseek-v4-flash-free",
+        "mimo-v2.5-free",
+        "laguna-s-2.1-free",
+        "ling-3.0-flash-free",
+        "north-mini-code-free",
+        "nemotron-3-ultra-free",
+    ]
+
+    assert mgr._suggested_models("opencode_zen") == common_paid + zen_free
+    assert mgr._suggested_models("opencode_go") == [
+        "grok-4.5", "glm-5.2", "glm-5.1", "kimi-k3", "kimi-k2.7-code",
+        "kimi-k2.6", "deepseek-v4-pro", "deepseek-v4-flash",
+        "mimo-v2.5", "mimo-v2.5-pro", "hy3",
+    ]
+    for model in (
+        *mgr._suggested_models("opencode_zen"),
+        *mgr._suggested_models("opencode_go"),
+    ):
+        assert not model.startswith(
+            ("gpt-", "claude-", "gemini-", "qwen")
+        )
+
+
 # -- last-used tracking (router on_use hook + manager persistence) ----------------
 
 
@@ -650,9 +696,27 @@ def test_opencode_remove_provider_only_wipes_target(tmp_path, monkeypatch):
     assert by_name["opencode_go"]["configured"] is True
 
 
+def test_opencode_remove_go_leaves_zen_intact(tmp_path, monkeypatch):
+    """Symmetric to the test above: removing the Go card must not wipe the Zen card."""
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    from coworker.server.manager import SessionManager
+
+    mgr = SessionManager(data_dir=tmp_path)
+    mgr.set_provider("opencode_zen", {"api_key": "oc-zen-key"})
+    mgr.set_provider("opencode_go", {"api_key": "oc-go-key"})
+
+    mgr.remove_provider("opencode_go")
+    assert not mgr.secrets.get("provider:opencode_go")
+    # Sibling untouched.
+    assert (mgr.secrets.get("provider:opencode_zen") or {}).get("api_key") == "oc-zen-key"
+    by_name = {p["name"]: p for p in mgr.get_providers()}
+    assert by_name["opencode_go"]["configured"] is False
+    assert by_name["opencode_zen"]["configured"] is True
+
+
 def test_opencode_first_configured_wins_default_model(tmp_path, monkeypatch):
     """Configuring OpenCode Zen (with OpenAI unconfigured) MUST swap the default
-    from `gpt-5.6-sol` to the Zen recommended model. Configuring Go later must
+    to its supported chat-completions recommendation. Configuring Go later must
     NOT steal that default."""
     monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -664,12 +728,12 @@ def test_opencode_first_configured_wins_default_model(tmp_path, monkeypatch):
     assert mgr.model == "gpt-5.6-sol"  # built-in default with no keys
 
     mgr.set_provider("opencode_zen", {"api_key": "oc-zen-key"})
-    assert "opencode_zen:gpt-5.6-sol" in mgr.get_settings()["models"]
-    assert mgr.model == "opencode_zen:gpt-5.6-sol"  # took over the default
+    assert "opencode_zen:grok-4.5" in mgr.get_settings()["models"]
+    assert mgr.model == "opencode_zen:grok-4.5"  # took over the default
 
     # Adding OpenCode Go later must NOT steal the default.
     mgr.set_provider("opencode_go", {"api_key": "oc-go-key"})
-    assert mgr.model == "opencode_zen:gpt-5.6-sol"  # unchanged
+    assert mgr.model == "opencode_zen:grok-4.5"  # unchanged
     assert "opencode_go:kimi-k3" in mgr.get_settings()["models"]
 
 
@@ -684,7 +748,7 @@ def test_opencode_verify_without_key_falls_back_to_own(tmp_path, monkeypatch):
     mgr.set_provider("opencode_go", {"api_key": "oc-go-key"})
 
     seen: dict = {}
-    def fake_verify(name, *, api_key=None, base_url=None, timeout=10.0):
+    def fake_verify(name, *, api_key=None, base_url=None, fields=None, timeout=10.0):
         seen["name"] = name
         seen["api_key"] = api_key
         return {"ok": True}
@@ -714,3 +778,23 @@ def test_opencode_router_invalidate_only_drops_named_client(tmp_path, monkeypatc
     assert "opencode_zen" not in router._clients
     assert "opencode_go" in router._clients  # sibling preserved
     assert "anthropic" in router._clients  # unrelated preserved
+
+
+def test_opencode_manager_refreshes_only_changed_provider(tmp_path, monkeypatch):
+    """Manager save/remove operations invalidate only the selected OpenCode client."""
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    from coworker.server.manager import SessionManager
+
+    mgr = SessionManager(data_dir=tmp_path)
+    invalidated: list[str | None] = []
+    monkeypatch.setattr(
+        mgr.provider,
+        "invalidate",
+        lambda name=None: invalidated.append(name),
+    )
+
+    mgr.set_provider("opencode_zen", {"api_key": "oc-zen-key"})
+    mgr.set_provider("opencode_go", {"api_key": "oc-go-key"})
+    mgr.remove_provider("opencode_zen")
+
+    assert invalidated == ["opencode_zen", "opencode_go", "opencode_zen"]
